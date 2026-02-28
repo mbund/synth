@@ -1,0 +1,23 @@
+{
+  "terminal_games_manifest_version": 1,
+  "shortname": "rust-ratatui-template",
+  "details": {
+    "name": {
+      "en": "Rust Ratatui Template"
+    },
+    "description": {
+      "en": "Official minimal Rust template"
+    },
+    "details": {
+      "en": "This shows a minimally featured \u001b]8;;https://rust-lang.org\u001b\\Rust\u001b]8;;\u001b\\ and \u001b]8;;https://ratatui.rs\u001b\\Ratatui\u001b]8;;\u001b\\ template to start out writing a terminal game with. \u001b[38;2;255;0;0m\u001b[48;2;0;0;255m▄\u001b[0m"
+    },
+    "screenshots": {
+      "en": [
+        {
+          "content": "\u001b[38;2;255;0;0m\u001b[48;2;0;0;255m▄\u001b[38;2;0;255;0m\u001b[48;2;255;105;180m▄\u001b[0m",
+          "caption": "Some pixel art"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "rust-ratatui-template"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false }
+terminal-games-sdk = { git = "https://github.com/terminal-games/terminal-games.git" }
