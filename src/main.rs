@@ -40,11 +40,15 @@ const PIANO_HEIGHT: usize = 13;
 const SYNTH_CHANNEL: i32 = 0;
 const KEYBOARD_BASE_NOTE: i32 = 60;
 const KEYBOARD_MAX_SEMITONE: i32 = 13;
-const HELP_HEIGHT: usize = 4;
+const HELP_HEIGHT: usize = 7;
 const PICKER_MAX_VISIBLE: usize = 8;
 const MIN_CONTENT_WIDTH_FOR_PADDING: usize = 24;
 const MIN_CONTENT_HEIGHT_FOR_PADDING: usize = PIANO_HEIGHT + HELP_HEIGHT + 3;
 const MAX_UI_COLUMN_WIDTH: usize = 96;
+const LOOP_MIN_DURATION: Duration = Duration::from_millis(300);
+const LOOP_CHANNEL_START: i32 = 1;
+const METRONOME_CHANNEL: i32 = 9;
+const METRONOME_CLICK_DURATION: Duration = Duration::from_millis(40);
 
 #[derive(Clone)]
 struct PresetChoice {
@@ -53,11 +57,301 @@ struct PresetChoice {
     patch: i32,
 }
 
-fn apply_preset(synthesizer: &mut rustysynth::Synthesizer, preset: &PresetChoice) {
+#[derive(Clone)]
+enum LoopEventKind {
+    NoteOn { note: i32, velocity: i32 },
+    NoteOff { note: i32 },
+    SetProgram { bank: i32, patch: i32 },
+    SetSustain { enabled: bool },
+}
+
+#[derive(Clone)]
+struct LoopEvent {
+    at: Duration,
+    kind: LoopEventKind,
+}
+
+struct LoopRecording {
+    started_at: Option<Instant>,
+    events: Vec<LoopEvent>,
+    held_notes: HashSet<i32>,
+    bpm: u32,
+    preset_index: usize,
+    sustain_enabled: bool,
+}
+
+struct LoopTrack {
+    instrument_name: String,
+    events: Vec<LoopEvent>,
+    beat_len: u32,
+    source_bpm: u32,
+    volume_percent: u8,
+    enabled: bool,
+    start_beat: f64,
+    pending_start_beat: Option<f64>,
+    active_notes: HashSet<i32>,
+    channel: i32,
+    preset_index: usize,
+    sustain_enabled: bool,
+}
+
+fn beat_duration_for_bpm(bpm: u32) -> Duration {
+    Duration::from_secs_f64(60.0 / bpm as f64)
+}
+
+fn quantize_loop_beats(length: Duration, bpm: u32) -> u32 {
+    let beat = beat_duration_for_bpm(bpm);
+    let beats = (length.as_secs_f64() / beat.as_secs_f64()).ceil();
+    beats.max(1.0) as u32
+}
+
+fn next_bar_start_beat(current_beats: f64, beats_per_bar: u8) -> f64 {
+    let bar = (beats_per_bar.max(1)) as f64;
+    (current_beats / bar).ceil() * bar
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiFocus {
+    Instrument,
+    Metronome,
+    Loop(usize),
+    AddLoop,
+}
+
+impl UiFocus {
+    fn prev(self, loop_count: usize) -> Self {
+        match self {
+            Self::Instrument => {
+                if loop_count == 0 {
+                    Self::AddLoop
+                } else {
+                    Self::Loop(loop_count - 1)
+                }
+            }
+            Self::Metronome => Self::Instrument,
+            Self::Loop(0) => Self::Metronome,
+            Self::Loop(idx) => Self::Loop(idx.saturating_sub(1)),
+            Self::AddLoop => {
+                if loop_count == 0 {
+                    Self::Metronome
+                } else {
+                    Self::Loop(loop_count - 1)
+                }
+            }
+        }
+    }
+
+    fn next(self, loop_count: usize) -> Self {
+        match self {
+            Self::Instrument => Self::Metronome,
+            Self::Metronome => {
+                if loop_count == 0 {
+                    Self::AddLoop
+                } else {
+                    Self::Loop(0)
+                }
+            }
+            Self::Loop(idx) => {
+                if idx + 1 < loop_count {
+                    Self::Loop(idx + 1)
+                } else {
+                    Self::AddLoop
+                }
+            }
+            Self::AddLoop => Self::Instrument,
+        }
+    }
+
+    fn normalize(self, loop_count: usize) -> Self {
+        match self {
+            Self::Loop(idx) if idx >= loop_count => {
+                if loop_count == 0 {
+                    Self::AddLoop
+                } else {
+                    Self::Loop(loop_count - 1)
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+fn allocate_loop_channel(loop_tracks: &[LoopTrack]) -> i32 {
+    for channel in 0..16 {
+        if channel == SYNTH_CHANNEL || channel == METRONOME_CHANNEL {
+            continue;
+        }
+        if !loop_tracks.iter().any(|track| track.channel == channel) {
+            return channel;
+        }
+    }
+    LOOP_CHANNEL_START
+}
+
+fn loop_color(index: usize) -> Color {
+    const COLORS: [Color; 8] = [
+        Color::Rgb(95, 165, 245),
+        Color::Rgb(240, 95, 95),
+        Color::Rgb(120, 200, 120),
+        Color::Rgb(245, 190, 95),
+        Color::Rgb(200, 120, 235),
+        Color::Rgb(90, 210, 200),
+        Color::Rgb(245, 145, 220),
+        Color::Rgb(180, 180, 100),
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+fn record_loop_event(recording: &mut Option<LoopRecording>, kind: LoopEventKind) {
+    if let Some(recording) = recording {
+        let at = match recording.started_at {
+            Some(started_at) => started_at.elapsed(),
+            None => match &kind {
+                LoopEventKind::NoteOn { .. } => {
+                    recording.started_at = Some(Instant::now());
+                    Duration::ZERO
+                }
+                LoopEventKind::SetProgram { .. } | LoopEventKind::SetSustain { .. } => Duration::ZERO,
+                LoopEventKind::NoteOff { .. } => return,
+            },
+        };
+        recording.events.push(LoopEvent {
+            at,
+            kind,
+        });
+    }
+}
+
+fn live_note_on(
+    synthesizer: &mut rustysynth::Synthesizer,
+    note: i32,
+    velocity: i32,
+    recording: &mut Option<LoopRecording>,
+) {
+    synthesizer.note_on(SYNTH_CHANNEL, note, velocity);
+    if let Some(recording) = recording {
+        recording.held_notes.insert(note);
+    }
+    record_loop_event(recording, LoopEventKind::NoteOn { note, velocity });
+}
+
+fn live_note_off(
+    synthesizer: &mut rustysynth::Synthesizer,
+    note: i32,
+    recording: &mut Option<LoopRecording>,
+) {
+    synthesizer.note_off(SYNTH_CHANNEL, note);
+    if let Some(recording) = recording {
+        recording.held_notes.remove(&note);
+    }
+    record_loop_event(recording, LoopEventKind::NoteOff { note });
+}
+
+fn flush_recording_held_notes(recording: &mut Option<LoopRecording>) {
+    if let Some(recording) = recording {
+        let Some(started_at) = recording.started_at else {
+            recording.held_notes.clear();
+            return;
+        };
+        let at = started_at.elapsed();
+        for note in recording.held_notes.drain() {
+            recording.events.push(LoopEvent {
+                at,
+                kind: LoopEventKind::NoteOff { note },
+            });
+        }
+    }
+}
+
+fn silence_loop_track(synthesizer: &mut rustysynth::Synthesizer, track: &mut LoopTrack) {
+    for note in track.active_notes.drain() {
+        synthesizer.note_off(track.channel, note);
+    }
+}
+
+fn arm_loop_start(
+    synthesizer: &mut rustysynth::Synthesizer,
+    track: &mut LoopTrack,
+    current_beats: f64,
+    beats_per_bar: u8,
+) {
+    silence_loop_track(synthesizer, track);
+    track.enabled = true;
+    track.pending_start_beat = Some(next_bar_start_beat(current_beats, beats_per_bar));
+}
+
+fn process_loop_track(
+    synthesizer: &mut rustysynth::Synthesizer,
+    track: &mut LoopTrack,
+    previous_beats: f64,
+    current_beats: f64,
+) {
+    if !track.enabled || track.events.is_empty() || track.beat_len == 0 {
+        return;
+    }
+    if let Some(start_at) = track.pending_start_beat {
+        if current_beats < start_at {
+            return;
+        }
+        track.start_beat = start_at;
+        track.pending_start_beat = None;
+    }
+    if current_beats < track.start_beat {
+        return;
+    }
+
+    let adjusted_previous = previous_beats.max(track.start_beat);
+    let cycle_beats = track.beat_len as f64;
+    let previous_phase = (adjusted_previous - track.start_beat).rem_euclid(cycle_beats);
+    let current_phase = (current_beats - track.start_beat).rem_euclid(cycle_beats);
+    let source_beat_secs = beat_duration_for_bpm(track.source_bpm).as_secs_f64();
+
+    let mut fire_event = |event: &LoopEvent| match &event.kind {
+        LoopEventKind::NoteOn { note, velocity } => {
+            synthesizer.note_on(track.channel, *note, *velocity);
+            track.active_notes.insert(*note);
+        }
+        LoopEventKind::NoteOff { note } => {
+            synthesizer.note_off(track.channel, *note);
+            track.active_notes.remove(note);
+        }
+        LoopEventKind::SetProgram { bank, patch } => {
+            synthesizer.process_midi_message(track.channel, 0xB0, 0x00, *bank);
+            synthesizer.process_midi_message(track.channel, 0xC0, *patch, 0);
+        }
+        LoopEventKind::SetSustain { enabled } => {
+            track.sustain_enabled = *enabled;
+        }
+    };
+
+    let mut process_window = |start: f64, end: f64, include_start: bool| {
+        for event in &track.events {
+            let event_phase = (event.at.as_secs_f64() / source_beat_secs).rem_euclid(cycle_beats);
+            let past_start = if include_start { event_phase >= start } else { event_phase > start };
+            if past_start && event_phase <= end {
+                fire_event(event);
+            }
+        }
+    };
+    let include_start = (adjusted_previous - track.start_beat).abs() < 1e-9;
+    if current_phase >= previous_phase {
+        process_window(previous_phase, current_phase, include_start);
+    } else {
+        process_window(previous_phase, cycle_beats, include_start);
+        process_window(0.0, current_phase, true);
+    }
+}
+
+fn apply_preset(synthesizer: &mut rustysynth::Synthesizer, preset: &PresetChoice, channel: i32) {
     let bank = preset.bank.clamp(0, 127);
     let patch = preset.patch.clamp(0, 127);
-    synthesizer.process_midi_message(SYNTH_CHANNEL, 0xB0, 0x00, bank);
-    synthesizer.process_midi_message(SYNTH_CHANNEL, 0xC0, patch, 0);
+    synthesizer.process_midi_message(channel, 0xB0, 0x00, bank);
+    synthesizer.process_midi_message(channel, 0xC0, patch, 0);
+}
+
+fn apply_loop_volume(synthesizer: &mut rustysynth::Synthesizer, channel: i32, volume_percent: u8) {
+    let cc_value = ((volume_percent as u16 * 127) / 100).min(127) as i32;
+    synthesizer.process_midi_message(channel, 0xB0, 0x07, cc_value);
 }
 
 fn terminal_likely_supports_kitty_protocol() -> bool {
@@ -307,6 +601,7 @@ fn release_or_sustain_note(
     legacy_note_off_deadlines: &HashMap<i32, Instant>,
     sustained_note_off_deadlines: &mut HashMap<i32, Instant>,
     mouse_note: Option<i32>,
+    recording: &mut Option<LoopRecording>,
 ) {
     let held_by_keyboard = active_key_notes.values().any(|n| *n == note);
     let held_by_legacy = legacy_note_off_deadlines
@@ -321,7 +616,7 @@ fn release_or_sustain_note(
         sustained_note_off_deadlines.insert(note, Instant::now() + SUSTAIN_TAIL_DURATION);
         active_notes.insert(note);
     } else if active_notes.remove(&note) {
-        synthesizer.note_off(SYNTH_CHANNEL, note);
+        live_note_off(synthesizer, note, recording);
     }
 }
 
@@ -453,7 +748,8 @@ fn note_at_piano_cell(
 }
 
 fn build_piano_lines(
-    active_notes: &HashSet<i32>,
+    live_active_notes: &HashSet<i32>,
+    loop_note_colors: &HashMap<i32, Color>,
     visible_white_notes: &[i32],
     keyboard_base_note: i32,
     left_pad: usize,
@@ -470,9 +766,10 @@ fn build_piano_lines(
 
     for i in 0..white_count {
         let note = visible_white_notes[i];
-        let pressed = active_notes.contains(&note);
-        let fill_style = if pressed {
+        let fill_style = if live_active_notes.contains(&note) {
             Style::default().fg(Color::White).bg(Color::Red)
+        } else if let Some(color) = loop_note_colors.get(&note) {
+            Style::default().fg(Color::Black).bg(*color)
         } else {
             Style::default()
                 .fg(Color::Black)
@@ -544,9 +841,10 @@ fn build_piano_lines(
         let Some(black) = black_after_white(white).filter(|n| *n <= MIDI_HIGH_NOTE) else {
             continue;
         };
-        let pressed = active_notes.contains(&black);
-        let black_fill = if pressed {
-            Style::default().fg(Color::Blue)
+        let black_fill = if live_active_notes.contains(&black) {
+            Style::default().fg(Color::Red)
+        } else if let Some(color) = loop_note_colors.get(&black) {
+            Style::default().fg(*color)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -639,7 +937,7 @@ fn main() -> std::io::Result<()> {
         rustysynth::SynthesizerSettings::new(terminal_games_sdk::audio::SAMPLE_RATE as i32);
     let mut synthesizer = rustysynth::Synthesizer::new(&sound_font, &settings).unwrap();
     if let Some(preset) = presets.get(current_preset_index) {
-        apply_preset(&mut synthesizer, preset);
+        apply_preset(&mut synthesizer, preset, SYNTH_CHANNEL);
     }
     let mut audio_writer = AudioWriter::default();
     let mut left = Vec::<f32>::new();
@@ -664,6 +962,16 @@ fn main() -> std::io::Result<()> {
     let mut picker_selected = 0usize;
     let mut picker_scroll = 0usize;
     let mut prev_content_width = 0usize;
+    let mut loop_tracks = Vec::<LoopTrack>::new();
+    let mut ui_focus = UiFocus::Instrument;
+    let mut loop_recording = None::<LoopRecording>;
+    let mut transport_beats = 0.0f64;
+    let mut last_transport_tick = Instant::now();
+    let mut metronome_enabled = false;
+    let mut metronome_bpm = 120u32;
+    let mut metronome_beats_per_bar = 4u8;
+    let mut last_metronome_beat_emitted = None::<u64>;
+    let mut metronome_note_off_deadlines = Vec::<(i32, Instant)>::new();
 
     let mut terminal_reader = TerminalReader {};
     let mut next_frame = std::time::Instant::now();
@@ -698,6 +1006,7 @@ fn main() -> std::io::Result<()> {
         let visible_white_notes = &all_white_notes[piano_scroll..(piano_scroll + white_count)];
         let piano_left = piano_left_offset(content_width, white_count, all_white_notes.len());
         let (ui_left, ui_width) = centered_column(content_width, MAX_UI_COLUMN_WIDTH);
+        ui_focus = ui_focus.normalize(loop_tracks.len());
         prev_content_width = content_width;
 
         for event in &mut terminal_reader {
@@ -714,7 +1023,10 @@ fn main() -> std::io::Result<()> {
                     continue;
                 }
 
-                if key_active && !picker_open && matches!(key_event.code, terminput::KeyCode::Enter)
+                if key_active
+                    && !picker_open
+                    && ui_focus == UiFocus::Instrument
+                    && matches!(key_event.code, terminput::KeyCode::Enter)
                 {
                     picker_open = true;
                     let filtered = filter_preset_indices(&presets, &preset_filter);
@@ -753,6 +1065,7 @@ fn main() -> std::io::Result<()> {
                             if let Some(&idx) = filtered.get(picker_selected) {
                                 if idx != current_preset_index {
                                     current_preset_index = idx;
+                                    flush_recording_held_notes(&mut loop_recording);
                                     clear_playing_notes(
                                         &mut synthesizer,
                                         &mut active_key_notes,
@@ -762,7 +1075,19 @@ fn main() -> std::io::Result<()> {
                                         &mut key_last_seen,
                                         &mut mouse_note,
                                     );
-                                    apply_preset(&mut synthesizer, &presets[current_preset_index]);
+                                    apply_preset(
+                                        &mut synthesizer,
+                                        &presets[current_preset_index],
+                                        SYNTH_CHANNEL,
+                                    );
+                                    let preset = &presets[current_preset_index];
+                                    record_loop_event(
+                                        &mut loop_recording,
+                                        LoopEventKind::SetProgram {
+                                            bank: preset.bank.clamp(0, 127),
+                                            patch: preset.patch.clamp(0, 127),
+                                        },
+                                    );
                                 }
                             }
                             picker_open = false;
@@ -796,9 +1121,325 @@ fn main() -> std::io::Result<()> {
                     continue;
                 }
 
+                if key_active && matches!(key_event.code, terminput::KeyCode::Up) {
+                    ui_focus = ui_focus.prev(loop_tracks.len());
+                    continue;
+                }
+                if key_active && matches!(key_event.code, terminput::KeyCode::Down) {
+                    ui_focus = ui_focus.next(loop_tracks.len());
+                    continue;
+                }
+
                 match key_event.code {
+                    terminput::KeyCode::Char('u')
+                        if matches!(ui_focus, UiFocus::AddLoop)
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        if loop_recording.is_none() {
+                            let mut recording = LoopRecording {
+                                started_at: None,
+                                events: Vec::new(),
+                                held_notes: HashSet::new(),
+                                bpm: metronome_bpm,
+                                preset_index: current_preset_index,
+                                sustain_enabled,
+                            };
+                            if let Some(preset) = presets.get(current_preset_index) {
+                                recording.events.push(LoopEvent {
+                                    at: Duration::ZERO,
+                                    kind: LoopEventKind::SetProgram {
+                                        bank: preset.bank.clamp(0, 127),
+                                        patch: preset.patch.clamp(0, 127),
+                                    },
+                                });
+                            }
+                            recording.events.push(LoopEvent {
+                                at: Duration::ZERO,
+                                kind: LoopEventKind::SetSustain { enabled: sustain_enabled },
+                            });
+                            loop_recording = Some(recording);
+                        } else if let Some(mut recording) = loop_recording.take() {
+                            let Some(started_at) = recording.started_at else {
+                                continue;
+                            };
+                            let length = started_at.elapsed().max(LOOP_MIN_DURATION);
+                            let beat_len = quantize_loop_beats(length, recording.bpm);
+                            for note in recording.held_notes.drain() {
+                                recording.events.push(LoopEvent {
+                                    at: length,
+                                    kind: LoopEventKind::NoteOff { note },
+                                });
+                            }
+                            recording.events.sort_by_key(|event| event.at);
+                            if !recording.events.is_empty() {
+                                let channel = allocate_loop_channel(&loop_tracks);
+                                let instrument_name = presets
+                                    .get(recording.preset_index)
+                                    .map(|preset| preset.name.clone())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                let track = LoopTrack {
+                                    instrument_name,
+                                    events: recording.events,
+                                    beat_len,
+                                    source_bpm: recording.bpm,
+                                    volume_percent: 100,
+                                    enabled: true,
+                                    start_beat: 0.0,
+                                    pending_start_beat: Some(next_bar_start_beat(
+                                        transport_beats,
+                                        metronome_beats_per_bar,
+                                    )),
+                                    active_notes: HashSet::new(),
+                                    channel,
+                                    preset_index: recording.preset_index,
+                                    sustain_enabled: recording.sustain_enabled,
+                                };
+                                if let Some(preset) = presets.get(track.preset_index) {
+                                    apply_preset(&mut synthesizer, preset, track.channel);
+                                }
+                                apply_loop_volume(&mut synthesizer, track.channel, track.volume_percent);
+                                loop_tracks.push(track);
+                                ui_focus = UiFocus::Loop(loop_tracks.len().saturating_sub(1));
+                            }
+                        }
+                    }
+                    terminput::KeyCode::Enter if key_active => match ui_focus {
+                        UiFocus::Metronome => {
+                            metronome_enabled = !metronome_enabled;
+                            last_metronome_beat_emitted = None;
+                        }
+                        UiFocus::AddLoop => {
+                            if loop_recording.is_none() {
+                                let mut recording = LoopRecording {
+                                    started_at: None,
+                                    events: Vec::new(),
+                                    held_notes: HashSet::new(),
+                                    bpm: metronome_bpm,
+                                    preset_index: current_preset_index,
+                                    sustain_enabled,
+                                };
+                                if let Some(preset) = presets.get(current_preset_index) {
+                                    recording.events.push(LoopEvent {
+                                        at: Duration::ZERO,
+                                        kind: LoopEventKind::SetProgram {
+                                            bank: preset.bank.clamp(0, 127),
+                                            patch: preset.patch.clamp(0, 127),
+                                        },
+                                    });
+                                }
+                                recording.events.push(LoopEvent {
+                                    at: Duration::ZERO,
+                                    kind: LoopEventKind::SetSustain { enabled: sustain_enabled },
+                                });
+                                loop_recording = Some(recording);
+                            } else if let Some(mut recording) = loop_recording.take() {
+                                let Some(started_at) = recording.started_at else {
+                                    continue;
+                                };
+                                let length = started_at.elapsed().max(LOOP_MIN_DURATION);
+                                let beat_len = quantize_loop_beats(length, recording.bpm);
+                                for note in recording.held_notes.drain() {
+                                    recording.events.push(LoopEvent {
+                                        at: length,
+                                        kind: LoopEventKind::NoteOff { note },
+                                    });
+                                }
+                                recording.events.sort_by_key(|event| event.at);
+                                if !recording.events.is_empty() {
+                                    let channel = allocate_loop_channel(&loop_tracks);
+                                    let instrument_name = presets
+                                        .get(recording.preset_index)
+                                        .map(|preset| preset.name.clone())
+                                        .unwrap_or_else(|| "Unknown".to_string());
+                                    let track = LoopTrack {
+                                        instrument_name,
+                                        events: recording.events,
+                                        beat_len,
+                                        source_bpm: recording.bpm,
+                                        volume_percent: 100,
+                                        enabled: true,
+                                        start_beat: 0.0,
+                                        pending_start_beat: Some(next_bar_start_beat(
+                                            transport_beats,
+                                            metronome_beats_per_bar,
+                                        )),
+                                        active_notes: HashSet::new(),
+                                        channel,
+                                        preset_index: recording.preset_index,
+                                        sustain_enabled: recording.sustain_enabled,
+                                    };
+                                    if let Some(preset) = presets.get(track.preset_index) {
+                                        apply_preset(&mut synthesizer, preset, track.channel);
+                                    }
+                                    apply_loop_volume(
+                                        &mut synthesizer,
+                                        track.channel,
+                                        track.volume_percent,
+                                    );
+                                    loop_tracks.push(track);
+                                    ui_focus = UiFocus::Loop(loop_tracks.len().saturating_sub(1));
+                                }
+                            }
+                        }
+                        UiFocus::Loop(selected_loop_index) => {
+                            if let Some(track) = loop_tracks.get_mut(selected_loop_index) {
+                                if track.enabled {
+                                    track.enabled = false;
+                                    track.pending_start_beat = None;
+                                    silence_loop_track(&mut synthesizer, track);
+                                } else {
+                                    if let Some(preset) = presets.get(track.preset_index) {
+                                        apply_preset(&mut synthesizer, preset, track.channel);
+                                    }
+                                    apply_loop_volume(
+                                        &mut synthesizer,
+                                        track.channel,
+                                        track.volume_percent,
+                                    );
+                                    arm_loop_start(
+                                        &mut synthesizer,
+                                        track,
+                                        transport_beats,
+                                        metronome_beats_per_bar,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    terminput::KeyCode::Char('i')
+                        if matches!(ui_focus, UiFocus::Loop(_))
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        let UiFocus::Loop(selected_loop_index) = ui_focus else {
+                            continue;
+                        };
+                        if let Some(track) = loop_tracks.get_mut(selected_loop_index) {
+                            if track.enabled {
+                                track.enabled = false;
+                                track.pending_start_beat = None;
+                                silence_loop_track(&mut synthesizer, track);
+                            } else {
+                                if let Some(preset) = presets.get(track.preset_index) {
+                                    apply_preset(&mut synthesizer, preset, track.channel);
+                                }
+                                apply_loop_volume(
+                                    &mut synthesizer,
+                                    track.channel,
+                                    track.volume_percent,
+                                );
+                                arm_loop_start(
+                                    &mut synthesizer,
+                                    track,
+                                    transport_beats,
+                                    metronome_beats_per_bar,
+                                );
+                            }
+                        }
+                    }
+                    terminput::KeyCode::Char('o')
+                        if matches!(ui_focus, UiFocus::Loop(_))
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        let UiFocus::Loop(selected_loop_index) = ui_focus else {
+                            continue;
+                        };
+                        let mut should_delete = false;
+                        if let Some(track) = loop_tracks.get_mut(selected_loop_index) {
+                            silence_loop_track(&mut synthesizer, track);
+                            should_delete = true;
+                        }
+                        if should_delete {
+                            loop_tracks.remove(selected_loop_index);
+                            ui_focus = UiFocus::Loop(selected_loop_index).normalize(loop_tracks.len());
+                        }
+                    }
+                    terminput::KeyCode::Char('d')
+                        if matches!(ui_focus, UiFocus::Loop(_))
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        let UiFocus::Loop(selected_loop_index) = ui_focus else {
+                            continue;
+                        };
+                        let mut should_delete = false;
+                        if let Some(track) = loop_tracks.get_mut(selected_loop_index) {
+                            silence_loop_track(&mut synthesizer, track);
+                            should_delete = true;
+                        }
+                        if should_delete {
+                            loop_tracks.remove(selected_loop_index);
+                            ui_focus = UiFocus::Loop(selected_loop_index).normalize(loop_tracks.len());
+                        }
+                    }
+                    terminput::KeyCode::Char('-')
+                    | terminput::KeyCode::Char('_')
+                        if matches!(ui_focus, UiFocus::Loop(_))
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        let UiFocus::Loop(selected_loop_index) = ui_focus else {
+                            continue;
+                        };
+                        if let Some(track) = loop_tracks.get_mut(selected_loop_index) {
+                            track.volume_percent = track.volume_percent.saturating_sub(5);
+                            apply_loop_volume(&mut synthesizer, track.channel, track.volume_percent);
+                        }
+                    }
+                    terminput::KeyCode::Char('=')
+                    | terminput::KeyCode::Char('+')
+                        if matches!(ui_focus, UiFocus::Loop(_))
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        let UiFocus::Loop(selected_loop_index) = ui_focus else {
+                            continue;
+                        };
+                        if let Some(track) = loop_tracks.get_mut(selected_loop_index) {
+                            track.volume_percent = track.volume_percent.saturating_add(5).min(200);
+                            apply_loop_volume(&mut synthesizer, track.channel, track.volume_percent);
+                        }
+                    }
+                    terminput::KeyCode::Char('-')
+                    | terminput::KeyCode::Char('_')
+                        if ui_focus == UiFocus::Metronome
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        metronome_bpm = metronome_bpm.saturating_sub(5).clamp(30, 280);
+                        last_metronome_beat_emitted = None;
+                    }
+                    terminput::KeyCode::Char('=')
+                    | terminput::KeyCode::Char('+')
+                        if ui_focus == UiFocus::Metronome
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        metronome_bpm = metronome_bpm.saturating_add(5).clamp(30, 280);
+                        last_metronome_beat_emitted = None;
+                    }
+                    terminput::KeyCode::Char(',')
+                        if ui_focus == UiFocus::Metronome
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        metronome_beats_per_bar =
+                            metronome_beats_per_bar.saturating_sub(1).clamp(1, 12);
+                        last_metronome_beat_emitted = None;
+                    }
+                    terminput::KeyCode::Char('.')
+                        if ui_focus == UiFocus::Metronome
+                            && matches!(key_event.kind, terminput::KeyEventKind::Press) =>
+                    {
+                        metronome_beats_per_bar =
+                            metronome_beats_per_bar.saturating_add(1).clamp(1, 12);
+                        last_metronome_beat_emitted = None;
+                    }
                     terminput::KeyCode::Char(' ') if key_active => {
                         sustain_enabled = !sustain_enabled;
+                        if let Some(recording) = &mut loop_recording {
+                            recording.sustain_enabled = sustain_enabled;
+                        }
+                        record_loop_event(
+                            &mut loop_recording,
+                            LoopEventKind::SetSustain {
+                                enabled: sustain_enabled,
+                            },
+                        );
                         if !sustain_enabled {
                             let sustained_notes: Vec<i32> =
                                 sustained_note_off_deadlines.keys().copied().collect();
@@ -812,6 +1453,7 @@ fn main() -> std::io::Result<()> {
                                     &legacy_note_off_deadlines,
                                     &mut sustained_note_off_deadlines,
                                     mouse_note,
+                                    &mut loop_recording,
                                 );
                             }
                             sustained_note_off_deadlines.clear();
@@ -826,6 +1468,7 @@ fn main() -> std::io::Result<()> {
                         }
                         std::io::stdout().flush()?;
 
+                        flush_recording_held_notes(&mut loop_recording);
                         clear_playing_notes(
                             &mut synthesizer,
                             &mut active_key_notes,
@@ -870,7 +1513,12 @@ fn main() -> std::io::Result<()> {
                                         e.insert(note);
                                         sustained_note_off_deadlines.remove(&note);
                                         active_notes.insert(note);
-                                        synthesizer.note_on(SYNTH_CHANNEL, note, 110);
+                                        live_note_on(
+                                            &mut synthesizer,
+                                            note,
+                                            110,
+                                            &mut loop_recording,
+                                        );
                                     }
                                     key_last_seen.insert(c, Instant::now());
                                 }
@@ -888,6 +1536,7 @@ fn main() -> std::io::Result<()> {
                                         &legacy_note_off_deadlines,
                                         &mut sustained_note_off_deadlines,
                                         mouse_note,
+                                        &mut loop_recording,
                                     );
                                 }
                                 terminput::KeyEventKind::Repeat => {
@@ -905,7 +1554,12 @@ fn main() -> std::io::Result<()> {
                                     };
                                     sustained_note_off_deadlines.remove(&note);
                                     active_notes.insert(note);
-                                    synthesizer.note_on(SYNTH_CHANNEL, note, 110);
+                                    live_note_on(
+                                        &mut synthesizer,
+                                        note,
+                                        110,
+                                        &mut loop_recording,
+                                    );
                                     legacy_note_off_deadlines
                                         .insert(note, Instant::now() + LEGACY_NOTE_DURATION);
                                 }
@@ -925,6 +1579,7 @@ fn main() -> std::io::Result<()> {
                                         &legacy_note_off_deadlines,
                                         &mut sustained_note_off_deadlines,
                                         mouse_note,
+                                        &mut loop_recording,
                                     );
                                 }
                             }
@@ -952,6 +1607,11 @@ fn main() -> std::io::Result<()> {
                 let instrument_line_row = PIANO_HEIGHT + 1;
                 let picker_y = instrument_line_row + 1;
                 let picker_width = ui_width.saturating_sub(2).min(58);
+                let picker_box_rows = if picker_open && picker_width >= 24 {
+                    picker_visible_rows + 4
+                } else {
+                    0
+                };
                 let list_top = picker_y + 3;
                 let list_bottom = list_top + picker_visible_rows;
 
@@ -962,6 +1622,7 @@ fn main() -> std::io::Result<()> {
                     && content_col >= ui_left
                     && content_col < ui_left + ui_width
                 {
+                    ui_focus = UiFocus::Instrument;
                     picker_open = !picker_open;
                     if picker_open {
                         let filtered = filter_preset_indices(&presets, &preset_filter);
@@ -1026,6 +1687,7 @@ fn main() -> std::io::Result<()> {
                             picker_selected = click_idx;
                             if idx != current_preset_index {
                                 current_preset_index = idx;
+                                flush_recording_held_notes(&mut loop_recording);
                                 clear_playing_notes(
                                     &mut synthesizer,
                                     &mut active_key_notes,
@@ -1035,11 +1697,264 @@ fn main() -> std::io::Result<()> {
                                     &mut key_last_seen,
                                     &mut mouse_note,
                                 );
-                                apply_preset(&mut synthesizer, &presets[current_preset_index]);
+                                apply_preset(
+                                    &mut synthesizer,
+                                    &presets[current_preset_index],
+                                    SYNTH_CHANNEL,
+                                );
+                                let preset = &presets[current_preset_index];
+                                record_loop_event(
+                                    &mut loop_recording,
+                                    LoopEventKind::SetProgram {
+                                        bank: preset.bank.clamp(0, 127),
+                                        patch: preset.patch.clamp(0, 127),
+                                    },
+                                );
                             }
                             picker_open = false;
                         }
                     }
+                    continue;
+                }
+
+                let metronome_line_row = instrument_line_row + 1 + picker_box_rows;
+                let first_loop_row = metronome_line_row + 1;
+                let add_loop_row = first_loop_row + loop_tracks.len();
+
+                if matches!(
+                    mouse.kind,
+                    terminput::MouseEventKind::Down(terminput::MouseButton::Left)
+                ) {
+                    if content_row == metronome_line_row
+                        && content_col >= ui_left
+                        && content_col < ui_left + ui_width
+                    {
+                        ui_focus = UiFocus::Metronome;
+                        let rel = content_col.saturating_sub(ui_left);
+                        let prefix = format!("x {} BPM {}/bar", metronome_bpm, metronome_beats_per_bar);
+                        let mut cursor = prefix.chars().count();
+                        let m_segment =
+                            format!("  enter {}", if metronome_enabled { "on" } else { "off" });
+                        let m_end = cursor + m_segment.chars().count();
+                        if rel >= cursor && rel < m_end {
+                            metronome_enabled = !metronome_enabled;
+                            last_metronome_beat_emitted = None;
+                        }
+                        cursor = m_end;
+
+                        let minus_segment = "  - bpm-";
+                        let minus_end = cursor + minus_segment.chars().count();
+                        if rel >= cursor && rel < minus_end {
+                            metronome_bpm = metronome_bpm.saturating_sub(1).clamp(30, 280);
+                            last_metronome_beat_emitted = None;
+                        }
+                        cursor = minus_end;
+
+                        let plus_segment = "  + bpm+";
+                        let plus_end = cursor + plus_segment.chars().count();
+                        if rel >= cursor && rel < plus_end {
+                            metronome_bpm = metronome_bpm.saturating_add(1).clamp(30, 280);
+                            last_metronome_beat_emitted = None;
+                        }
+                        cursor = plus_end;
+
+                        let bar_down_segment = "  , bar-";
+                        let bar_down_end = cursor + bar_down_segment.chars().count();
+                        if rel >= cursor && rel < bar_down_end {
+                            metronome_beats_per_bar =
+                                metronome_beats_per_bar.saturating_sub(1).clamp(1, 12);
+                            last_metronome_beat_emitted = None;
+                        }
+                        cursor = bar_down_end;
+
+                        let bar_up_segment = "  . bar+";
+                        let bar_up_end = cursor + bar_up_segment.chars().count();
+                        if rel >= cursor && rel < bar_up_end {
+                            metronome_beats_per_bar =
+                                metronome_beats_per_bar.saturating_add(1).clamp(1, 12);
+                            last_metronome_beat_emitted = None;
+                        }
+                        continue;
+                    }
+
+                    if content_row >= first_loop_row && content_row < first_loop_row + loop_tracks.len()
+                    {
+                        let idx = content_row - first_loop_row;
+                        ui_focus = UiFocus::Loop(idx);
+                        let mut delete_clicked = false;
+                        if let Some(track) = loop_tracks.get_mut(idx) {
+                            let rel = content_col.saturating_sub(ui_left);
+                            let sustain_tag = if track.sustain_enabled { " sustain" } else { "" };
+                            let info = format!(" {}{}", track.instrument_name, sustain_tag);
+                            let hint = format!(
+                                " vol:{}%  enter {}  d delete  {} beats",
+                                track.volume_percent,
+                                if track.enabled { "pause" } else { "play" },
+                                track.beat_len
+                            );
+                            let hint_start = 2 + 1 + info.chars().count();
+                            let play_word = if track.enabled { "pause" } else { "play" };
+                            let play_start = hint_start + hint.find(play_word).unwrap_or(usize::MAX);
+                            let play_end = play_start + play_word.chars().count();
+                            let delete_start =
+                                hint_start + hint.find("delete").unwrap_or(usize::MAX);
+                            let delete_end = delete_start + "delete".chars().count();
+                            if rel >= play_start && rel < play_end {
+                                if track.enabled {
+                                    track.enabled = false;
+                                    track.pending_start_beat = None;
+                                    silence_loop_track(&mut synthesizer, track);
+                                } else {
+                                    if let Some(preset) = presets.get(track.preset_index) {
+                                        apply_preset(&mut synthesizer, preset, track.channel);
+                                    }
+                                    apply_loop_volume(
+                                        &mut synthesizer,
+                                        track.channel,
+                                        track.volume_percent,
+                                    );
+                                    arm_loop_start(
+                                        &mut synthesizer,
+                                        track,
+                                        transport_beats,
+                                        metronome_beats_per_bar,
+                                    );
+                                }
+                                continue;
+                            }
+                            if rel >= delete_start && rel < delete_end {
+                                silence_loop_track(&mut synthesizer, track);
+                                delete_clicked = true;
+                            }
+                        }
+                        if delete_clicked {
+                            loop_tracks.remove(idx);
+                            ui_focus = UiFocus::Loop(idx).normalize(loop_tracks.len());
+                            continue;
+                        }
+                    }
+
+                    if content_row == add_loop_row
+                        && content_col >= ui_left
+                        && content_col < ui_left + ui_width
+                    {
+                        ui_focus = UiFocus::AddLoop;
+                        if loop_recording.is_none() {
+                            let mut recording = LoopRecording {
+                                started_at: None,
+                                events: Vec::new(),
+                                held_notes: HashSet::new(),
+                                bpm: metronome_bpm,
+                                preset_index: current_preset_index,
+                                sustain_enabled,
+                            };
+                            if let Some(preset) = presets.get(current_preset_index) {
+                                recording.events.push(LoopEvent {
+                                    at: Duration::ZERO,
+                                    kind: LoopEventKind::SetProgram {
+                                        bank: preset.bank.clamp(0, 127),
+                                        patch: preset.patch.clamp(0, 127),
+                                    },
+                                });
+                            }
+                            recording.events.push(LoopEvent {
+                                at: Duration::ZERO,
+                                kind: LoopEventKind::SetSustain { enabled: sustain_enabled },
+                            });
+                            loop_recording = Some(recording);
+                        } else if let Some(mut recording) = loop_recording.take() {
+                            let Some(started_at) = recording.started_at else {
+                                continue;
+                            };
+                            let length = started_at.elapsed().max(LOOP_MIN_DURATION);
+                            let beat_len = quantize_loop_beats(length, recording.bpm);
+                            for note in recording.held_notes.drain() {
+                                recording.events.push(LoopEvent {
+                                    at: length,
+                                    kind: LoopEventKind::NoteOff { note },
+                                });
+                            }
+                            recording.events.sort_by_key(|event| event.at);
+                            if !recording.events.is_empty() {
+                                let channel = allocate_loop_channel(&loop_tracks);
+                                let instrument_name = presets
+                                    .get(recording.preset_index)
+                                    .map(|preset| preset.name.clone())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                let track = LoopTrack {
+                                    instrument_name,
+                                    events: recording.events,
+                                    beat_len,
+                                    source_bpm: recording.bpm,
+                                    volume_percent: 100,
+                                    enabled: true,
+                                    start_beat: 0.0,
+                                    pending_start_beat: Some(next_bar_start_beat(
+                                        transport_beats,
+                                        metronome_beats_per_bar,
+                                    )),
+                                    active_notes: HashSet::new(),
+                                    channel,
+                                    preset_index: recording.preset_index,
+                                    sustain_enabled: recording.sustain_enabled,
+                                };
+                                if let Some(preset) = presets.get(track.preset_index) {
+                                    apply_preset(&mut synthesizer, preset, track.channel);
+                                }
+                                apply_loop_volume(&mut synthesizer, track.channel, track.volume_percent);
+                                loop_tracks.push(track);
+                                ui_focus = UiFocus::Loop(loop_tracks.len().saturating_sub(1));
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                if matches!(
+                    mouse.kind,
+                    terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up)
+                        | terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down)
+                ) && content_row >= first_loop_row
+                    && content_row < first_loop_row + loop_tracks.len()
+                    && content_col >= ui_left
+                    && content_col < ui_left + ui_width
+                {
+                    let idx = content_row - first_loop_row;
+                    ui_focus = UiFocus::Loop(idx);
+                    if let Some(track) = loop_tracks.get_mut(idx) {
+                        match mouse.kind {
+                            terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up) => {
+                                track.volume_percent = track.volume_percent.saturating_add(5).min(200);
+                            }
+                            terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down) => {
+                                track.volume_percent = track.volume_percent.saturating_sub(5);
+                            }
+                            _ => {}
+                        }
+                        apply_loop_volume(&mut synthesizer, track.channel, track.volume_percent);
+                    }
+                    continue;
+                }
+
+                if matches!(
+                    mouse.kind,
+                    terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up)
+                        | terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down)
+                ) && content_row == metronome_line_row
+                    && content_col >= ui_left
+                    && content_col < ui_left + ui_width
+                {
+                    ui_focus = UiFocus::Metronome;
+                    match mouse.kind {
+                        terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up) => {
+                            metronome_bpm = metronome_bpm.saturating_add(1).clamp(30, 280);
+                        }
+                        terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down) => {
+                            metronome_bpm = metronome_bpm.saturating_sub(1).clamp(30, 280);
+                        }
+                        _ => {}
+                    }
+                    last_metronome_beat_emitted = None;
                     continue;
                 }
 
@@ -1081,6 +1996,7 @@ fn main() -> std::io::Result<()> {
                                     &legacy_note_off_deadlines,
                                     &mut sustained_note_off_deadlines,
                                     mouse_note,
+                                    &mut loop_recording,
                                 );
                             }
 
@@ -1088,7 +2004,12 @@ fn main() -> std::io::Result<()> {
                                 mouse_note = Some(new_note);
                                 sustained_note_off_deadlines.remove(&new_note);
                                 active_notes.insert(new_note);
-                                synthesizer.note_on(SYNTH_CHANNEL, new_note, 110);
+                                live_note_on(
+                                    &mut synthesizer,
+                                    new_note,
+                                    110,
+                                    &mut loop_recording,
+                                );
                             }
                         }
                     }
@@ -1103,6 +2024,7 @@ fn main() -> std::io::Result<()> {
                                 &legacy_note_off_deadlines,
                                 &mut sustained_note_off_deadlines,
                                 mouse_note,
+                                &mut loop_recording,
                             );
                         }
                     }
@@ -1149,6 +2071,7 @@ fn main() -> std::io::Result<()> {
                         &legacy_note_off_deadlines,
                         &mut sustained_note_off_deadlines,
                         mouse_note,
+                        &mut loop_recording,
                     );
                 }
             }
@@ -1171,6 +2094,7 @@ fn main() -> std::io::Result<()> {
                     &legacy_note_off_deadlines,
                     &mut sustained_note_off_deadlines,
                     mouse_note,
+                    &mut loop_recording,
                 );
             }
         }
@@ -1194,9 +2118,51 @@ fn main() -> std::io::Result<()> {
                     &legacy_note_off_deadlines,
                     &mut sustained_note_off_deadlines,
                     mouse_note,
+                    &mut loop_recording,
                 );
             }
         }
+
+        let now = Instant::now();
+        let delta = now.saturating_duration_since(last_transport_tick);
+        last_transport_tick = now;
+        let previous_transport_beats = transport_beats;
+        transport_beats += delta.as_secs_f64() * (metronome_bpm as f64) / 60.0;
+        for track in &mut loop_tracks {
+            process_loop_track(
+                &mut synthesizer,
+                track,
+                previous_transport_beats,
+                transport_beats,
+            );
+        }
+        if metronome_enabled {
+            let current_beat = transport_beats.floor() as u64;
+            let first = last_metronome_beat_emitted
+                .map(|beat| beat.saturating_add(1))
+                .unwrap_or(current_beat.saturating_add(1));
+            for beat in first..=current_beat {
+                let beat_in_bar = (beat % metronome_beats_per_bar as u64) as u8;
+                let (note, velocity) = if beat_in_bar == 0 {
+                    (76, 120)
+                } else {
+                    (77, 90)
+                };
+                synthesizer.note_on(METRONOME_CHANNEL, note, velocity);
+                metronome_note_off_deadlines.push((note, now + METRONOME_CLICK_DURATION));
+            }
+            last_metronome_beat_emitted = Some(current_beat);
+        } else {
+            last_metronome_beat_emitted = None;
+        }
+
+        metronome_note_off_deadlines.retain(|(note, deadline)| {
+            let keep = now < *deadline;
+            if !keep {
+                synthesizer.note_off(METRONOME_CHANNEL, *note);
+            }
+            keep
+        });
 
         pump_audio(
             &mut audio_writer,
@@ -1223,8 +2189,19 @@ fn main() -> std::io::Result<()> {
                 piano_left_offset(content.width as usize, white_count, all_white_notes.len());
             let (ui_left, ui_width) = centered_column(content.width as usize, MAX_UI_COLUMN_WIDTH);
             let mut lines = Vec::new();
+            let mut loop_note_colors = HashMap::<i32, Color>::new();
+            for (idx, track) in loop_tracks.iter().enumerate() {
+                if !track.enabled {
+                    continue;
+                }
+                let color = loop_color(idx);
+                for &note in &track.active_notes {
+                    loop_note_colors.entry(note).or_insert(color);
+                }
+            }
             lines.extend(build_piano_lines(
                 &active_notes,
+                &loop_note_colors,
                 visible_white_notes,
                 keyboard_base_note,
                 piano_left,
@@ -1245,16 +2222,16 @@ fn main() -> std::io::Result<()> {
             let very_muted = Style::default().fg(Color::DarkGray);
 
             lines.push(Line::from(""));
+            let instrument_focus = if ui_focus == UiFocus::Instrument {
+                "▸"
+            } else {
+                " "
+            };
             lines.push(Line::from(vec![
                 Span::raw(pad.to_string()),
-                Span::styled(
-                    format!(
-                        "{} Instrument: {}",
-                        if picker_open { "▾" } else { "▸" },
-                        instrument
-                    ),
-                    Style::default().fg(Color::Gray),
-                ),
+                Span::styled(format!("{instrument_focus} {instrument}"), Style::default().fg(Color::Gray)),
+                Span::styled("  enter", very_muted),
+                Span::styled(" change", Style::default().fg(Color::Gray)),
             ]));
 
             if picker_open && picker_width >= 24 {
@@ -1334,96 +2311,115 @@ fn main() -> std::io::Result<()> {
                 ]));
             }
 
-            let sustain_state = if sustain_enabled { "on" } else { "off" };
-            let protocol_mode = if enhanced_input { "kitty" } else { "normal" };
-            let left_col_width = 29;
-            let help_lines = if picker_open {
-                vec![
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "up/down",
-                        "move selection",
-                        "enter",
-                        "choose instrument",
-                        left_col_width,
-                    ),
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "type",
-                        "filter text",
-                        "backspace",
-                        "delete char",
-                        left_col_width,
-                    ),
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "esc",
-                        "close picker",
-                        "space",
-                        &format!("sustain {sustain_state}"),
-                        left_col_width,
-                    ),
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "`",
-                        &format!("input protocol: {protocol_mode}"),
-                        "",
-                        "",
-                        left_col_width,
-                    ),
-                ]
+            let metronome_focus = if ui_focus == UiFocus::Metronome {
+                "▸"
             } else {
-                vec![
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "a/;",
-                        "shift keyboard octave",
-                        "left/right",
-                        "pan piano roll",
-                        left_col_width,
-                    ),
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "`",
-                        &format!("input protocol: {protocol_mode}"),
-                        "",
-                        "",
-                        left_col_width,
-                    ),
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "space",
-                        &format!("sustain {sustain_state}"),
-                        "enter",
-                        "instrument picker",
-                        left_col_width,
-                    ),
-                    help_row(
-                        &pad,
-                        muted,
-                        very_muted,
-                        "esc",
-                        "quit",
-                        "",
-                        "",
-                        left_col_width,
-                    ),
-                ]
+                " "
             };
+            lines.push(Line::from(vec![
+                Span::raw(pad.to_string()),
+                Span::styled(
+                    format!(
+                        "{} {} BPM {}/bar",
+                        metronome_focus, metronome_bpm, metronome_beats_per_bar
+                    ),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled("  enter", very_muted),
+                Span::styled(
+                    format!(" {}", if metronome_enabled { "on" } else { "off" }),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled("  -", very_muted),
+                Span::styled(" bpm-", Style::default().fg(Color::Gray)),
+                Span::styled("  +", very_muted),
+                Span::styled(" bpm+", Style::default().fg(Color::Gray)),
+                Span::styled("  ,", very_muted),
+                Span::styled(" bar-", Style::default().fg(Color::Gray)),
+                Span::styled("  .", very_muted),
+                Span::styled(" bar+", Style::default().fg(Color::Gray)),
+            ]));
+            for (idx, track) in loop_tracks.iter().enumerate() {
+                let arrow = if ui_focus == UiFocus::Loop(idx) { "▸" } else { " " };
+                let sustain_tag = if track.sustain_enabled { " sustain" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::raw(pad.to_string()),
+                    Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray)),
+                    Span::styled("■", Style::default().fg(loop_color(idx))),
+                    Span::styled(
+                        format!(" {}{}", track.instrument_name, sustain_tag),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!(" vol:{}%", track.volume_percent),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled("  enter", very_muted),
+                    Span::styled(
+                        format!(" {}", if track.enabled { "pause" } else { "play" }),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled("  d", very_muted),
+                    Span::styled(" delete", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!(" {} beats", track.beat_len),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::raw(pad.to_string()),
+                Span::styled(
+                    if ui_focus == UiFocus::AddLoop { "▸ " } else { "  " },
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled("■", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Add Loop", Style::default().fg(Color::Gray)),
+                Span::styled("  enter", very_muted),
+                Span::styled(
+                    if loop_recording.is_some() {
+                        " save"
+                    } else {
+                        " record"
+                    },
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+
+            let protocol_mode = if enhanced_input { "kitty" } else { "normal" };
+            let left_col_width = 34;
+            let help_lines = vec![
+                help_row(
+                    &pad,
+                    muted,
+                    very_muted,
+                    "up/down",
+                    "move cursor",
+                    "left/right",
+                    "pan piano roll",
+                    left_col_width,
+                ),
+                help_row(
+                    &pad,
+                    muted,
+                    very_muted,
+                    "a/;",
+                    "shift keyboard octave",
+                    "space",
+                    if sustain_enabled { "sustain on" } else { "sustain off" },
+                    left_col_width,
+                ),
+                help_row(
+                    &pad,
+                    muted,
+                    very_muted,
+                    "`",
+                    &format!("input protocol: {protocol_mode}"),
+                    "esc",
+                    "quit",
+                    left_col_width,
+                ),
+            ];
             let reserved_bottom = help_lines.len();
             if (content.height as usize) > reserved_bottom
                 && lines.len() < (content.height as usize) - reserved_bottom
