@@ -1,15 +1,16 @@
+use ratatui::{
+    Terminal,
+    layout::Rect,
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 use std::{
     collections::{HashMap, HashSet},
     env,
     io::Write,
     sync::Arc,
     time::{Duration, Instant},
-};
-use ratatui::{
-    Terminal,
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
 };
 use terminal_games_sdk::{
     app,
@@ -32,8 +33,8 @@ const KITTY_KEYBOARD_ENABLE: &[u8] = b"\x1b[>11u";
 const KITTY_KEYBOARD_DISABLE: &[u8] = b"\x1b[<u";
 const MOUSE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const MOUSE_DISABLE: &[u8] = b"\x1b[?1002l\x1b[?1006l";
-const PIANO_LOW_NOTE: i32 = 48;
-const PIANO_HIGH_NOTE: i32 = 95;
+const MIDI_LOW_NOTE: i32 = 0;
+const MIDI_HIGH_NOTE: i32 = 127;
 const PIANO_KEY_WIDTH: usize = 4;
 const PIANO_HEIGHT: usize = 13;
 const SYNTH_CHANNEL: i32 = 0;
@@ -41,8 +42,9 @@ const KEYBOARD_BASE_NOTE: i32 = 60;
 const KEYBOARD_MAX_SEMITONE: i32 = 13;
 const HELP_HEIGHT: usize = 4;
 const PICKER_MAX_VISIBLE: usize = 8;
-const VIEW_TOP_PAD: usize = 1;
-const VIEW_BOTTOM_PAD: usize = 1;
+const MIN_CONTENT_WIDTH_FOR_PADDING: usize = 24;
+const MIN_CONTENT_HEIGHT_FOR_PADDING: usize = PIANO_HEIGHT + HELP_HEIGHT + 3;
+const MAX_UI_COLUMN_WIDTH: usize = 96;
 
 #[derive(Clone)]
 struct PresetChoice {
@@ -69,7 +71,6 @@ fn terminal_likely_supports_kitty_protocol() -> bool {
     return false;
 }
 
-
 fn key_to_semitone(c: char) -> Option<i32> {
     let c = c.to_ascii_lowercase();
     match c {
@@ -92,21 +93,21 @@ fn key_to_semitone(c: char) -> Option<i32> {
 }
 
 fn octave_shift_bounds() -> (i32, i32) {
-    let min = (PIANO_LOW_NOTE - KEYBOARD_BASE_NOTE).div_euclid(12);
-    let max = (PIANO_HIGH_NOTE - KEYBOARD_BASE_NOTE - KEYBOARD_MAX_SEMITONE).div_euclid(12);
+    let min = (MIDI_LOW_NOTE - KEYBOARD_BASE_NOTE).div_euclid(12);
+    let max = (MIDI_HIGH_NOTE - KEYBOARD_BASE_NOTE - KEYBOARD_MAX_SEMITONE).div_euclid(12);
     (min, max)
 }
 
-fn key_to_note(c: char, octave_shift: i32) -> Option<i32> {
+fn key_to_note(c: char, keyboard_base_note: i32) -> Option<i32> {
     let semitone = key_to_semitone(c)?;
-    let note = KEYBOARD_BASE_NOTE + octave_shift * 12 + semitone;
-    (PIANO_LOW_NOTE..=PIANO_HIGH_NOTE)
+    let note = keyboard_base_note + semitone;
+    (MIDI_LOW_NOTE..=MIDI_HIGH_NOTE)
         .contains(&note)
         .then_some(note)
 }
 
-fn display_label_for_note(note: i32, octave_shift: i32) -> char {
-    let offset = note - (KEYBOARD_BASE_NOTE + octave_shift * 12);
+fn display_label_for_note(note: i32, keyboard_base_note: i32) -> char {
+    let offset = note - keyboard_base_note;
     match offset {
         0 => 's',
         2 => 'd',
@@ -156,13 +157,114 @@ fn row_to_line(chars: &[char], styles: &[Style]) -> Line<'static> {
 }
 
 fn white_notes() -> Vec<i32> {
-    (PIANO_LOW_NOTE..=PIANO_HIGH_NOTE)
+    (MIDI_LOW_NOTE..=MIDI_HIGH_NOTE)
         .filter(|n| is_white_key(*n))
         .collect()
 }
 
-fn piano_width() -> usize {
-    white_notes().len() * PIANO_KEY_WIDTH + 1
+fn visible_white_count(area_width: usize, total_white_keys: usize) -> usize {
+    (area_width.saturating_sub(1) / PIANO_KEY_WIDTH)
+        .max(1)
+        .min(total_white_keys.max(1))
+}
+
+fn piano_width(visible_white_count: usize) -> usize {
+    visible_white_count * PIANO_KEY_WIDTH + 1
+}
+
+fn piano_left_offset(
+    content_width: usize,
+    visible_white_count: usize,
+    total_white_count: usize,
+) -> usize {
+    let width = piano_width(visible_white_count);
+    if visible_white_count == total_white_count && content_width > width {
+        (content_width - width) / 2
+    } else {
+        0
+    }
+}
+
+fn should_use_outer_padding(width: usize, height: usize) -> bool {
+    width >= MIN_CONTENT_WIDTH_FOR_PADDING + 2 && height >= MIN_CONTENT_HEIGHT_FOR_PADDING + 2
+}
+
+fn content_viewport(width: u16, height: u16) -> (usize, usize, usize, usize) {
+    let pad = should_use_outer_padding(width as usize, height as usize) as usize;
+    (
+        pad,
+        pad,
+        (width as usize).saturating_sub(pad * 2),
+        (height as usize).saturating_sub(pad * 2),
+    )
+}
+
+fn content_area(area: Rect) -> Rect {
+    let (x, y, width, height) = content_viewport(area.width, area.height);
+    if x > 0 {
+        Rect {
+            x: area.x + x as u16,
+            y: area.y + y as u16,
+            width: width as u16,
+            height: height as u16,
+        }
+    } else {
+        area
+    }
+}
+
+fn centered_column(container_width: usize, max_width: usize) -> (usize, usize) {
+    let width = container_width.min(max_width).max(1);
+    ((container_width.saturating_sub(width)) / 2, width)
+}
+
+fn white_index_for_note(all_white_notes: &[i32], note: i32) -> usize {
+    let target = if is_white_key(note) { note } else { note - 1 };
+    match all_white_notes.binary_search(&target) {
+        Ok(idx) => idx,
+        Err(idx) => idx
+            .saturating_sub(1)
+            .min(all_white_notes.len().saturating_sub(1)),
+    }
+}
+
+fn piano_scroll_with_playable_keys_visible(
+    all_white_notes: &[i32],
+    piano_scroll: usize,
+    white_count: usize,
+    keyboard_base_note: i32,
+    focus_note: Option<i32>,
+) -> usize {
+    if all_white_notes.is_empty() || white_count == 0 {
+        return 0;
+    }
+
+    let max_scroll = all_white_notes.len().saturating_sub(white_count);
+    let mut scroll = if let Some(note) = focus_note {
+        let focus_idx =
+            white_index_for_note(all_white_notes, note.clamp(MIDI_LOW_NOTE, MIDI_HIGH_NOTE));
+        focus_idx.saturating_sub(white_count / 2).min(max_scroll)
+    } else {
+        piano_scroll.min(max_scroll)
+    };
+    let low_note = keyboard_base_note.clamp(MIDI_LOW_NOTE, MIDI_HIGH_NOTE);
+    let high_note =
+        (keyboard_base_note + KEYBOARD_MAX_SEMITONE).clamp(MIDI_LOW_NOTE, MIDI_HIGH_NOTE);
+    let required_start = white_index_for_note(all_white_notes, low_note);
+    let required_end = white_index_for_note(all_white_notes, high_note);
+    let required_span = required_end.saturating_sub(required_start) + 1;
+
+    if required_span >= white_count {
+        return required_start.min(max_scroll);
+    }
+    if required_start < scroll {
+        scroll = required_start;
+    }
+    let visible_end = scroll + white_count - 1;
+    if required_end > visible_end {
+        scroll = required_end + 1 - white_count;
+    }
+    scroll.min(max_scroll)
 }
 
 fn filter_preset_indices(presets: &[PresetChoice], filter: &str) -> Vec<usize> {
@@ -171,13 +273,8 @@ fn filter_preset_indices(presets: &[PresetChoice], filter: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(idx, preset)| {
-            let haystack = format!(
-                "{} {} {}",
-                preset.name,
-                preset.bank,
-                preset.patch
-            )
-            .to_ascii_lowercase();
+            let haystack =
+                format!("{} {} {}", preset.name, preset.bank, preset.patch).to_ascii_lowercase();
             haystack.contains(&needle).then_some(idx)
         })
         .collect()
@@ -245,7 +342,9 @@ fn sync_picker_state(
         *picker_scroll = *picker_selected;
     }
     if *picker_selected >= *picker_scroll + visible_rows {
-        *picker_scroll = (*picker_selected).saturating_add(1).saturating_sub(visible_rows);
+        *picker_scroll = (*picker_selected)
+            .saturating_add(1)
+            .saturating_sub(visible_rows);
     }
 }
 
@@ -259,7 +358,7 @@ fn truncate_and_pad(input: &str, width: usize) -> String {
 }
 
 fn picker_visible_rows_for_height(total_height: usize) -> usize {
-    let reserved = VIEW_TOP_PAD + PIANO_HEIGHT + 1 + 1 + HELP_HEIGHT + VIEW_BOTTOM_PAD + 4;
+    let reserved = PIANO_HEIGHT + 1 + 1 + HELP_HEIGHT + 4;
     total_height
         .saturating_sub(reserved)
         .max(1)
@@ -315,21 +414,25 @@ fn help_row(
     ])
 }
 
-fn note_at_piano_cell(column: usize, row: usize, left_pad: usize) -> Option<i32> {
+fn note_at_piano_cell(
+    column: usize,
+    row: usize,
+    left_pad: usize,
+    visible_white_notes: &[i32],
+) -> Option<i32> {
     if row >= PIANO_HEIGHT {
         return None;
     }
 
-    let width = piano_width();
+    let width = piano_width(visible_white_notes.len());
     if column < left_pad || column >= left_pad + width {
         return None;
     }
     let x = column - left_pad;
-    let white_notes = white_notes();
 
     if (1..=6).contains(&row) {
-        for (i, white) in white_notes.iter().enumerate() {
-            let Some(black) = black_after_white(*white).filter(|n| *n <= PIANO_HIGH_NOTE) else {
+        for (i, white) in visible_white_notes.iter().enumerate() {
+            let Some(black) = black_after_white(*white).filter(|n| *n <= MIDI_HIGH_NOTE) else {
                 continue;
             };
             let center = (i + 1) * PIANO_KEY_WIDTH;
@@ -343,15 +446,19 @@ fn note_at_piano_cell(column: usize, row: usize, left_pad: usize) -> Option<i32>
 
     if (1..=(PIANO_HEIGHT - 2)).contains(&row) {
         let idx = x / PIANO_KEY_WIDTH;
-        return white_notes.get(idx).copied();
+        return visible_white_notes.get(idx).copied();
     }
 
     None
 }
 
-fn build_piano_lines(active_notes: &HashSet<i32>, left_pad: usize, octave_shift: i32) -> Vec<Line<'static>> {
-    let white_notes: Vec<i32> = white_notes();
-    let white_count = white_notes.len();
+fn build_piano_lines(
+    active_notes: &HashSet<i32>,
+    visible_white_notes: &[i32],
+    keyboard_base_note: i32,
+    left_pad: usize,
+) -> Vec<Line<'static>> {
+    let white_count = visible_white_notes.len();
     let key_w = PIANO_KEY_WIDTH;
     let width = white_count * key_w + 1;
     let height = PIANO_HEIGHT;
@@ -362,12 +469,14 @@ fn build_piano_lines(active_notes: &HashSet<i32>, left_pad: usize, octave_shift:
     let border_style = Style::default().fg(Color::Gray);
 
     for i in 0..white_count {
-        let note = white_notes[i];
+        let note = visible_white_notes[i];
         let pressed = active_notes.contains(&note);
         let fill_style = if pressed {
             Style::default().fg(Color::White).bg(Color::Red)
         } else {
-            Style::default().fg(Color::Black).bg(Color::Rgb(230, 230, 230))
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(230, 230, 230))
         };
 
         let x0 = left_pad + i * key_w;
@@ -398,10 +507,23 @@ fn build_piano_lines(active_notes: &HashSet<i32>, left_pad: usize, octave_shift:
             }
         }
 
-        let label = display_label_for_note(note, octave_shift);
+        let label = display_label_for_note(note, keyboard_base_note);
         if label != ' ' {
-            chars[height - 2][x0 + 2] = label;
-            styles[height - 2][x0 + 2] = Style::default().fg(Color::Black).bg(fill_style.bg.unwrap_or(Color::Reset));
+            chars[height - 3][x0 + 2] = label;
+            styles[height - 3][x0 + 2] = Style::default()
+                .fg(Color::Black)
+                .bg(fill_style.bg.unwrap_or(Color::Reset));
+        }
+
+        if note.rem_euclid(12) == 0 {
+            let octave = note.div_euclid(12) - 1;
+            let label = format!("C{octave}");
+            for (offset, c) in label.chars().take(key_w - 1).enumerate() {
+                chars[height - 2][x0 + 1 + offset] = c;
+                styles[height - 2][x0 + 1 + offset] = Style::default()
+                    .fg(Color::Black)
+                    .bg(fill_style.bg.unwrap_or(Color::Reset));
+            }
         }
     }
 
@@ -418,8 +540,8 @@ fn build_piano_lines(active_notes: &HashSet<i32>, left_pad: usize, octave_shift:
     }
 
     for i in 0..white_count {
-        let white = white_notes[i];
-        let Some(black) = black_after_white(white).filter(|n| *n <= 95) else {
+        let white = visible_white_notes[i];
+        let Some(black) = black_after_white(white).filter(|n| *n <= MIDI_HIGH_NOTE) else {
             continue;
         };
         let pressed = active_notes.contains(&black);
@@ -513,7 +635,8 @@ fn main() -> std::io::Result<()> {
         .position(|preset| preset.bank == 0 && preset.patch == 0)
         .unwrap_or(0);
 
-    let settings = rustysynth::SynthesizerSettings::new(terminal_games_sdk::audio::SAMPLE_RATE as i32);
+    let settings =
+        rustysynth::SynthesizerSettings::new(terminal_games_sdk::audio::SAMPLE_RATE as i32);
     let mut synthesizer = rustysynth::Synthesizer::new(&sound_font, &settings).unwrap();
     if let Some(preset) = presets.get(current_preset_index) {
         apply_preset(&mut synthesizer, preset);
@@ -531,10 +654,16 @@ fn main() -> std::io::Result<()> {
     let mut sustain_enabled = false;
     let (min_octave_shift, max_octave_shift) = octave_shift_bounds();
     let mut octave_shift = 0;
+    let all_white_notes = white_notes();
+    let mut piano_scroll = all_white_notes
+        .iter()
+        .position(|note| *note == KEYBOARD_BASE_NOTE)
+        .unwrap_or(0);
     let mut picker_open = false;
     let mut preset_filter = String::new();
     let mut picker_selected = 0usize;
     let mut picker_scroll = 0usize;
+    let mut prev_content_width = 0usize;
 
     let mut terminal_reader = TerminalReader {};
     let mut next_frame = std::time::Instant::now();
@@ -544,12 +673,37 @@ fn main() -> std::io::Result<()> {
             break;
         }
         let area = terminal.size()?;
-        let left_pad = (area.width as usize).saturating_sub(piano_width()) / 2;
+        let (content_x, content_y, content_width, content_height) =
+            content_viewport(area.width, area.height);
+        let white_count = visible_white_count(content_width, all_white_notes.len());
+        let max_piano_scroll = all_white_notes.len().saturating_sub(white_count);
+        let keyboard_base_note = KEYBOARD_BASE_NOTE + octave_shift * 12;
+        let resized = content_width != prev_content_width;
+        let focus_note = if resized {
+            if active_notes.is_empty() {
+                Some(keyboard_base_note + KEYBOARD_MAX_SEMITONE / 2)
+            } else {
+                Some(active_notes.iter().copied().sum::<i32>() / active_notes.len() as i32)
+            }
+        } else {
+            None
+        };
+        piano_scroll = piano_scroll_with_playable_keys_visible(
+            &all_white_notes,
+            piano_scroll,
+            white_count,
+            keyboard_base_note,
+            focus_note,
+        );
+        let visible_white_notes = &all_white_notes[piano_scroll..(piano_scroll + white_count)];
+        let piano_left = piano_left_offset(content_width, white_count, all_white_notes.len());
+        let (ui_left, ui_width) = centered_column(content_width, MAX_UI_COLUMN_WIDTH);
+        prev_content_width = content_width;
 
         for event in &mut terminal_reader {
             if let Some(key_event) = event.as_key() {
                 let key_active = key_event.kind != terminput::KeyEventKind::Release;
-                let picker_visible_rows = picker_visible_rows_for_height(area.height as usize);
+                let picker_visible_rows = picker_visible_rows_for_height(content_height);
 
                 if key_active && matches!(key_event.code, terminput::KeyCode::Esc) {
                     if picker_open {
@@ -560,9 +714,7 @@ fn main() -> std::io::Result<()> {
                     continue;
                 }
 
-                if key_active
-                    && !picker_open
-                    && matches!(key_event.code, terminput::KeyCode::Enter)
+                if key_active && !picker_open && matches!(key_event.code, terminput::KeyCode::Enter)
                 {
                     picker_open = true;
                     let filtered = filter_preset_indices(&presets, &preset_filter);
@@ -645,9 +797,7 @@ fn main() -> std::io::Result<()> {
                 }
 
                 match key_event.code {
-                    terminput::KeyCode::Char(' ')
-                        if key_active =>
-                    {
+                    terminput::KeyCode::Char(' ') if key_active => {
                         sustain_enabled = !sustain_enabled;
                         if !sustain_enabled {
                             let sustained_notes: Vec<i32> =
@@ -667,9 +817,7 @@ fn main() -> std::io::Result<()> {
                             sustained_note_off_deadlines.clear();
                         }
                     }
-                    terminput::KeyCode::Char('`')
-                        if key_active =>
-                    {
+                    terminput::KeyCode::Char('`') if key_active => {
                         enhanced_input = !enhanced_input;
                         if enhanced_input {
                             std::io::stdout().write(KITTY_KEYBOARD_ENABLE)?;
@@ -688,18 +836,22 @@ fn main() -> std::io::Result<()> {
                             &mut mouse_note,
                         );
                     }
-                    terminput::KeyCode::Char('a')
-                        if key_active =>
-                    {
+                    terminput::KeyCode::Char('a') if key_active => {
                         if octave_shift > min_octave_shift {
                             octave_shift -= 1;
                         }
                     }
-                    terminput::KeyCode::Char(';')
-                        if key_active =>
-                    {
+                    terminput::KeyCode::Char(';') if key_active => {
                         if octave_shift < max_octave_shift {
                             octave_shift += 1;
+                        }
+                    }
+                    terminput::KeyCode::Left if key_active => {
+                        piano_scroll = piano_scroll.saturating_sub(1);
+                    }
+                    terminput::KeyCode::Right if key_active => {
+                        if piano_scroll < max_piano_scroll {
+                            piano_scroll += 1;
                         }
                     }
                     terminput::KeyCode::Char(c) => {
@@ -707,7 +859,9 @@ fn main() -> std::io::Result<()> {
                         if enhanced_input {
                             match key_event.kind {
                                 terminput::KeyEventKind::Press => {
-                                    let Some(note) = key_to_note(c, octave_shift) else {
+                                    let Some(note) =
+                                        key_to_note(c, KEYBOARD_BASE_NOTE + octave_shift * 12)
+                                    else {
                                         continue;
                                     };
                                     if let std::collections::hash_map::Entry::Vacant(e) =
@@ -742,8 +896,11 @@ fn main() -> std::io::Result<()> {
                             }
                         } else {
                             match key_event.kind {
-                                terminput::KeyEventKind::Press | terminput::KeyEventKind::Repeat => {
-                                    let Some(note) = key_to_note(c, octave_shift) else {
+                                terminput::KeyEventKind::Press
+                                | terminput::KeyEventKind::Repeat => {
+                                    let Some(note) =
+                                        key_to_note(c, KEYBOARD_BASE_NOTE + octave_shift * 12)
+                                    else {
                                         continue;
                                     };
                                     sustained_note_off_deadlines.remove(&note);
@@ -753,7 +910,9 @@ fn main() -> std::io::Result<()> {
                                         .insert(note, Instant::now() + LEGACY_NOTE_DURATION);
                                 }
                                 terminput::KeyEventKind::Release => {
-                                    let Some(note) = key_to_note(c, octave_shift) else {
+                                    let Some(note) =
+                                        key_to_note(c, KEYBOARD_BASE_NOTE + octave_shift * 12)
+                                    else {
                                         continue;
                                     };
                                     legacy_note_off_deadlines.remove(&note);
@@ -778,22 +937,30 @@ fn main() -> std::io::Result<()> {
             if let Some(mouse) = event.as_mouse() {
                 let row = mouse.row as usize;
                 let col = mouse.column as usize;
-                let picker_visible_rows = picker_visible_rows_for_height(area.height as usize);
-                let picker_x = left_pad;
-                let instrument_line_row = VIEW_TOP_PAD + PIANO_HEIGHT + 1;
+                if row < content_y
+                    || row >= content_y + content_height
+                    || col < content_x
+                    || col >= content_x + content_width
+                {
+                    continue;
+                }
+
+                let content_row = row - content_y;
+                let content_col = col - content_x;
+                let picker_visible_rows = picker_visible_rows_for_height(content_height);
+                let picker_x = ui_left;
+                let instrument_line_row = PIANO_HEIGHT + 1;
                 let picker_y = instrument_line_row + 1;
-                let picker_width = (area.width as usize)
-                    .saturating_sub(left_pad + 2)
-                    .min(58);
+                let picker_width = ui_width.saturating_sub(2).min(58);
                 let list_top = picker_y + 3;
                 let list_bottom = list_top + picker_visible_rows;
 
                 if matches!(
                     mouse.kind,
                     terminput::MouseEventKind::Down(terminput::MouseButton::Left)
-                ) && row == instrument_line_row
-                    && col >= left_pad
-                    && col < left_pad + piano_width()
+                ) && content_row == instrument_line_row
+                    && content_col >= ui_left
+                    && content_col < ui_left + ui_width
                 {
                     picker_open = !picker_open;
                     if picker_open {
@@ -821,10 +988,14 @@ fn main() -> std::io::Result<()> {
                         let filtered = filter_preset_indices(&presets, &preset_filter);
                         if !filtered.is_empty() {
                             match mouse.kind {
-                                terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up) => {
+                                terminput::MouseEventKind::Scroll(
+                                    terminput::ScrollDirection::Up,
+                                ) => {
                                     picker_selected = picker_selected.saturating_sub(1);
                                 }
-                                terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down) => {
+                                terminput::MouseEventKind::Scroll(
+                                    terminput::ScrollDirection::Down,
+                                ) => {
                                     if picker_selected + 1 < filtered.len() {
                                         picker_selected += 1;
                                     }
@@ -844,13 +1015,13 @@ fn main() -> std::io::Result<()> {
                         mouse.kind,
                         terminput::MouseEventKind::Down(terminput::MouseButton::Left)
                     ) && picker_width >= 24
-                        && row >= list_top
-                        && row < list_bottom
-                        && col > picker_x
-                        && col < picker_x + picker_width - 1
+                        && content_row >= list_top
+                        && content_row < list_bottom
+                        && content_col > picker_x
+                        && content_col < picker_x + picker_width - 1
                     {
                         let filtered = filter_preset_indices(&presets, &preset_filter);
-                        let click_idx = picker_scroll + (row - list_top);
+                        let click_idx = picker_scroll + (content_row - list_top);
                         if let Some(&idx) = filtered.get(click_idx) {
                             picker_selected = click_idx;
                             if idx != current_preset_index {
@@ -872,9 +1043,30 @@ fn main() -> std::io::Result<()> {
                     continue;
                 }
 
-                let hit = row
-                    .checked_sub(VIEW_TOP_PAD)
-                    .and_then(|piano_row| note_at_piano_cell(col, piano_row, left_pad));
+                if matches!(
+                    mouse.kind,
+                    terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up)
+                        | terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down)
+                ) && content_row < PIANO_HEIGHT
+                    && content_col >= piano_left
+                    && content_col < piano_left + piano_width(visible_white_notes.len())
+                {
+                    match mouse.kind {
+                        terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Up) => {
+                            piano_scroll = piano_scroll.saturating_sub(1);
+                        }
+                        terminput::MouseEventKind::Scroll(terminput::ScrollDirection::Down) => {
+                            if piano_scroll < max_piano_scroll {
+                                piano_scroll += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                let hit =
+                    note_at_piano_cell(content_col, content_row, piano_left, visible_white_notes);
                 match mouse.kind {
                     terminput::MouseEventKind::Down(terminput::MouseButton::Left)
                     | terminput::MouseEventKind::Drag(terminput::MouseButton::Left) => {
@@ -920,7 +1112,7 @@ fn main() -> std::io::Result<()> {
         }
 
         {
-            let picker_visible_rows = picker_visible_rows_for_height(area.height as usize);
+            let picker_visible_rows = picker_visible_rows_for_height(content_height);
             let filtered = filter_preset_indices(&presets, &preset_filter);
             sync_picker_state(
                 &mut picker_selected,
@@ -929,6 +1121,13 @@ fn main() -> std::io::Result<()> {
                 picker_visible_rows,
             );
         }
+        piano_scroll = piano_scroll_with_playable_keys_visible(
+            &all_white_notes,
+            piano_scroll,
+            white_count,
+            KEYBOARD_BASE_NOTE + octave_shift * 12,
+            None,
+        );
 
         if enhanced_input {
             let now = Instant::now();
@@ -1009,23 +1208,45 @@ fn main() -> std::io::Result<()> {
 
         terminal.draw(|frame| {
             let area = frame.area();
-            let left_pad = (area.width as usize).saturating_sub(piano_width()) / 2;
+            let content = content_area(area);
+            let white_count = visible_white_count(content.width as usize, all_white_notes.len());
+            let piano_scroll = piano_scroll_with_playable_keys_visible(
+                &all_white_notes,
+                piano_scroll,
+                white_count,
+                KEYBOARD_BASE_NOTE + octave_shift * 12,
+                None,
+            );
+            let visible_white_notes = &all_white_notes[piano_scroll..(piano_scroll + white_count)];
+            let keyboard_base_note = KEYBOARD_BASE_NOTE + octave_shift * 12;
+            let piano_left =
+                piano_left_offset(content.width as usize, white_count, all_white_notes.len());
+            let (ui_left, ui_width) = centered_column(content.width as usize, MAX_UI_COLUMN_WIDTH);
             let mut lines = Vec::new();
-            lines.push(Line::from(""));
-            lines.extend(build_piano_lines(&active_notes, left_pad, octave_shift));
+            lines.extend(build_piano_lines(
+                &active_notes,
+                visible_white_notes,
+                keyboard_base_note,
+                piano_left,
+            ));
             let instrument = presets
                 .get(current_preset_index)
-                .map(|preset| format!("{} (bank {}, patch {})", preset.name, preset.bank, preset.patch))
+                .map(|preset| {
+                    format!(
+                        "{} (bank {}, patch {})",
+                        preset.name, preset.bank, preset.patch
+                    )
+                })
                 .unwrap_or_else(|| "N/A".to_string());
-            let pad = " ".repeat(left_pad);
-            let picker_width = (area.width as usize).saturating_sub(left_pad + 2).min(58);
-            let picker_visible_rows = picker_visible_rows_for_height(area.height as usize);
+            let pad = " ".repeat(ui_left);
+            let picker_width = ui_width.saturating_sub(2).min(58);
+            let picker_visible_rows = picker_visible_rows_for_height(content.height as usize);
             let muted = Style::default().fg(Color::Gray);
             let very_muted = Style::default().fg(Color::DarkGray);
 
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::raw(pad.clone()),
+                Span::raw(pad.to_string()),
                 Span::styled(
                     format!(
                         "{} Instrument: {}",
@@ -1041,11 +1262,11 @@ fn main() -> std::io::Result<()> {
                 let inner = picker_width - 2;
                 let border_style = Style::default().fg(Color::Gray);
                 lines.push(Line::from(vec![
-                    Span::raw(pad.clone()),
+                    Span::raw(pad.to_string()),
                     Span::styled(format!("┌{}┐", "─".repeat(inner)), border_style),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::raw(pad.clone()),
+                    Span::raw(pad.to_string()),
                     Span::styled("│", border_style),
                     Span::styled(
                         truncate_and_pad(&format!(" Filter: {}", preset_filter), inner),
@@ -1054,13 +1275,13 @@ fn main() -> std::io::Result<()> {
                     Span::styled("│", border_style),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::raw(pad.clone()),
+                    Span::raw(pad.to_string()),
                     Span::styled(format!("├{}┤", "─".repeat(inner)), border_style),
                 ]));
 
                 if filtered.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::raw(pad.clone()),
+                        Span::raw(pad.to_string()),
                         Span::styled("│", border_style),
                         Span::styled(
                             truncate_and_pad(" No matches", inner),
@@ -1070,7 +1291,7 @@ fn main() -> std::io::Result<()> {
                     ]));
                     for _ in 1..picker_visible_rows {
                         lines.push(Line::from(vec![
-                            Span::raw(pad.clone()),
+                            Span::raw(pad.to_string()),
                             Span::styled("│", border_style),
                             Span::styled(" ".repeat(inner), Style::default().fg(Color::Gray)),
                             Span::styled("│", border_style),
@@ -1084,10 +1305,7 @@ fn main() -> std::io::Result<()> {
                             let marker = if idx == picker_selected { "▶" } else { " " };
                             let label = format!(
                                 " {} {}  [{:03}:{:03}]",
-                                marker,
-                                preset.name,
-                                preset.bank,
-                                preset.patch
+                                marker, preset.name, preset.bank, preset.patch
                             );
                             let style = if idx == picker_selected {
                                 Style::default().fg(Color::White)
@@ -1095,17 +1313,14 @@ fn main() -> std::io::Result<()> {
                                 Style::default().fg(Color::Gray)
                             };
                             lines.push(Line::from(vec![
-                                Span::raw(pad.clone()),
+                                Span::raw(pad.to_string()),
                                 Span::styled("│", border_style),
-                                Span::styled(
-                                    truncate_and_pad(&label, inner),
-                                    style,
-                                ),
+                                Span::styled(truncate_and_pad(&label, inner), style),
                                 Span::styled("│", border_style),
                             ]));
                         } else {
                             lines.push(Line::from(vec![
-                                Span::raw(pad.clone()),
+                                Span::raw(pad.to_string()),
                                 Span::styled("│", border_style),
                                 Span::styled(" ".repeat(inner), Style::default().fg(Color::Gray)),
                                 Span::styled("│", border_style),
@@ -1114,7 +1329,7 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 lines.push(Line::from(vec![
-                    Span::raw(pad.clone()),
+                    Span::raw(pad.to_string()),
                     Span::styled(format!("└{}┘", "─".repeat(inner)), border_style),
                 ]));
             }
@@ -1172,9 +1387,19 @@ fn main() -> std::io::Result<()> {
                         muted,
                         very_muted,
                         "a/;",
-                        "octave down/up",
+                        "shift keyboard octave",
+                        "left/right",
+                        "pan piano roll",
+                        left_col_width,
+                    ),
+                    help_row(
+                        &pad,
+                        muted,
+                        very_muted,
                         "`",
                         &format!("input protocol: {protocol_mode}"),
+                        "",
+                        "",
                         left_col_width,
                     ),
                     help_row(
@@ -1197,24 +1422,19 @@ fn main() -> std::io::Result<()> {
                         "",
                         left_col_width,
                     ),
-                    Line::from(vec![Span::raw(pad.clone())]),
                 ]
             };
-            let reserved_bottom = help_lines.len() + VIEW_BOTTOM_PAD;
-            if (area.height as usize) > reserved_bottom && lines.len() < (area.height as usize) - reserved_bottom {
-                let blanks = (area.height as usize) - reserved_bottom - lines.len();
+            let reserved_bottom = help_lines.len();
+            if (content.height as usize) > reserved_bottom
+                && lines.len() < (content.height as usize) - reserved_bottom
+            {
+                let blanks = (content.height as usize) - reserved_bottom - lines.len();
                 for _ in 0..blanks {
                     lines.push(Line::from(""));
                 }
             }
             lines.extend(help_lines);
-            for _ in 0..VIEW_BOTTOM_PAD {
-                lines.push(Line::from(""));
-            }
-            frame.render_widget(
-                Paragraph::new(lines),
-                area,
-            );
+            frame.render_widget(Paragraph::new(lines), content);
         })?;
 
         next_frame += FRAME_DURATION;
