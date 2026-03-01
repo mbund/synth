@@ -1,4 +1,6 @@
-# rust-ratatui-template
+# synth
+
+From https://musescore.org/en/handbook/3/soundfonts-and-sfz-files "The free default soundfont that comes with MuseScore 1" and licensed under the GNU GPL, version 2.
 
 Run it with the following commands:
 
