@@ -265,7 +265,7 @@ fn main() -> std::io::Result<()> {
     let mut next_frame = std::time::Instant::now();
 
     'outer: loop {
-        if app::graceful_shutdown_poll() {
+        if app::graceful_shutdown_poll()? {
             break;
         }
         let area = terminal.size()?;
@@ -298,6 +298,7 @@ fn main() -> std::io::Result<()> {
         prev_content_width = content_width;
 
         for event in &mut terminal_reader {
+            let event = event?;
             if let Some(key_event) = event.as_key() {
                 let key_active = key_event.kind != terminput::KeyEventKind::Release;
                 let picker_visible_rows = picker_visible_rows_for_height(content_height);
@@ -1081,7 +1082,7 @@ fn main() -> std::io::Result<()> {
             &mut left,
             &mut right,
             &mut interleaved,
-        );
+        )?;
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -1277,8 +1278,8 @@ fn main() -> std::io::Result<()> {
                 &mut left,
                 &mut right,
                 &mut interleaved,
-            );
-            mixer().tick();
+            )?;
+            mixer().tick()?;
             let now = std::time::Instant::now();
             let Some(remaining) = next_frame.checked_duration_since(now) else {
                 break;

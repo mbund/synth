@@ -2,6 +2,8 @@
   "terminal_games_manifest_version": 1,
   "shortname": "synth",
   "details": {
+    "author": "mbund",
+    "version": "v1.0.0",
     "name": {
       "en": "Synth"
     },

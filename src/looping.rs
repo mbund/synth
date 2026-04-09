@@ -2,6 +2,7 @@ use crate::model::{LoopEvent, LoopEventKind, LoopRecording, LoopTrack, PresetCho
 use ratatui::style::Color;
 use std::{
     collections::{HashMap, HashSet},
+    io,
     time::{Duration, Instant},
 };
 use terminal_games_sdk::audio::{self, AudioWriter};
@@ -345,10 +346,10 @@ pub fn pump_audio(
     left: &mut Vec<f32>,
     right: &mut Vec<f32>,
     interleaved: &mut Vec<f32>,
-) {
-    let needed_frames = audio_writer.should_write();
+) -> io::Result<()> {
+    let needed_frames = audio_writer.should_write()?;
     if needed_frames == 0 {
-        return;
+        return Ok(());
     }
 
     left.resize(needed_frames, 0.0);
@@ -362,8 +363,10 @@ pub fn pump_audio(
         interleaved.push(r);
     }
 
-    let written = audio::write(interleaved);
+    let written = audio::write(interleaved)?;
     if written > 0 {
         audio_writer.next_pts += written as u64;
     }
+
+    Ok(())
 }
